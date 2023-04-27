@@ -14,10 +14,11 @@ import (
 	"math/big"
 	"os/exec"
 	"reflect"
-	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"strings"
 	"testing"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	configv1 "github.com/openshift/api/config/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
@@ -37,20 +38,46 @@ import (
 	"k8s.io/utils/pointer"
 )
 
-// lookForStringInPodExec looks for expectedString in the output of command
-// executed in the specified pod container every 2 seconds until the timeout
-// is reached or the string is found. Returns an error if the string was not found.
-func lookForStringInPodExec(ns, pod, container string, command []string, expectedString string, timeout time.Duration) error {
-	cmdPath, err := exec.LookPath("oc")
+// repeatedlyLookForStringInPodExec continuously executes a command in
+// a specified container within a given pod and namespace, searching
+// for an expected string in the command's output until the timeout is
+// reached. If the expected string is not found within the timeout
+// duration, an error is returned. It calls lookForStringInPodExec on
+// each invocation.
+func repeatedlyLookForStringInPodExec(ns, pod, container string, command []string, expectedString string, timeout time.Duration) error {
+	err := wait.PollImmediate(2*time.Second, timeout, func() (bool, error) {
+		found, err := lookForStringInPodExec(ns, pod, container, command, expectedString)
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return true, nil
+		}
+		return false, nil
+	})
 	if err != nil {
-		return err
-	}
-	args := []string{"exec", pod, "-c", container, fmt.Sprintf("--namespace=%v", ns), "--"}
-	args = append(args, command...)
-	if err := lookForString(cmdPath, args, expectedString, timeout); err != nil {
-		return err
+		return fmt.Errorf("failed to find %q", expectedString)
 	}
 	return nil
+}
+
+// lookForStringInPodExec searches for a specific string within the
+// output of a command executed in a container within a specified pod
+// and namespace. Returns true if the expected string is found, false
+// otherwise. If an error occurs executing the process, it returns an
+// error.
+func lookForStringInPodExec(namespace, pod, container string, command []string, expectedString string) (bool, error) {
+	cmdPath, err := exec.LookPath("oc")
+	if err != nil {
+		return false, err
+	}
+	args := []string{"exec", pod, "-c", container, fmt.Sprintf("--namespace=%v", namespace), "--"}
+	args = append(args, command...)
+	result, err := runCmd(cmdPath, args)
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(result, expectedString), nil
 }
 
 // lookForStringInPodLog looks for the given string in the log of the
@@ -68,19 +95,23 @@ func lookForStringInPodLog(ns, pod, container, expectedString string, timeout ti
 	return nil
 }
 
-// lookForStringInPodLog looks for the given string in the log of the
-// specified pod container every 2 seconds until the timeout is reached
-// or the string is found. Returns an error if the string was not found.
-func lookForSubStringsInPodLog(ns, pod, container string, timeout time.Duration, expectedStrings ...string) error {
+// lookForSubStringsInPodLog searches for multiple substrings within
+// the logs of a specified container within a given pod and namespace.
+// Returns true if all expected substrings are found, false otherwise.
+// If an error occurs during the process, it returns an error.
+func lookForSubStringsInPodLog(ns, pod, container string, expectedStrings ...string) (bool, error) {
 	cmdPath, err := exec.LookPath("oc")
 	if err != nil {
-		return err
+		return false, err
 	}
 	args := []string{"logs", pod, "-c", container, fmt.Sprintf("--namespace=%v", ns)}
-	if bool, err := lookForSubStrings(cmdPath, args, timeout, expectedStrings); err != nil && !bool {
-		return err
+	result, err := runCmd(cmdPath, args)
+	if err != nil {
+		return false, err
 	}
-	return nil
+	slicedResult := strings.Split(result, "\"")
+	slicedResultToString := strings.Join(slicedResult, " ")
+	return checkSubStrings(slicedResultToString, expectedStrings)
 }
 
 // lookForString looks for the given string using cmd and args every
@@ -89,7 +120,6 @@ func lookForSubStringsInPodLog(ns, pod, container string, timeout time.Duration,
 func lookForString(cmd string, args []string, expectedString string, timeout time.Duration) error {
 	err := wait.PollImmediate(2*time.Second, timeout, func() (bool, error) {
 		result, err := runCmd(cmd, args)
-		//fmt.Printf("\n result %v", result)
 		if err != nil {
 			return false, nil
 		}
@@ -102,24 +132,6 @@ func lookForString(cmd string, args []string, expectedString string, timeout tim
 		return fmt.Errorf("failed to find %q", expectedString)
 	}
 	return nil
-}
-func lookForSubStrings(cmd string, args []string, timeout time.Duration, expectedStrings []string) (bool, error) {
-	err := wait.PollImmediate(2*time.Second, timeout, func() (bool, error) {
-		result, err := runCmd(cmd, args)
-		if err != nil {
-			return false, nil
-		}
-		slicedResult := strings.Split(result, "\"")
-		slicedResultToString := strings.Join(slicedResult, " ")
-		if bool, err := checkSubStrings(slicedResultToString, expectedStrings); err != nil && !bool {
-			return false, nil
-		}
-		return true, nil
-	})
-	if err != nil {
-		return false, fmt.Errorf("failed to find %q", expectedStrings)
-	}
-	return true, nil
 }
 
 func checkSubStrings(str string, subs []string) (bool, error) {
